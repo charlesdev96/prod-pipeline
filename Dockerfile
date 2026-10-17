@@ -2,7 +2,7 @@
 FROM node:24-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev && mkdir -p node_modules
 
 # ---- Stage 2: runner - small image that only runs the app ----
 FROM node:24-alpine AS runner
