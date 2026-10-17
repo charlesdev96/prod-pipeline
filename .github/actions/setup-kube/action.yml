@@ -1,0 +1,53 @@
+name: Set up cluster access
+description: Uses the KUBECONFIG secret if there is one, otherwise creates a temporary demo cluster with kind
+
+inputs:
+  kubeconfig:
+    description: Contents of a kubeconfig file (leave empty to use a temporary kind cluster)
+    required: false
+    default: ""
+  image:
+    description: Image to load into the temporary kind cluster
+    required: false
+    default: ""
+  github-token:
+    description: Token used to pull the image from GitHub Container Registry
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+  - name: Use the kubeconfig secret
+    if: inputs.kubeconfig != ''
+    shell: bash
+    env:
+      KUBECONFIG_CONTENT: ${{ inputs.kubeconfig }}
+    run: |
+      mkdir -p "$HOME/.kube"
+      echo "$KUBECONFIG_CONTENT" > "$HOME/.kube/config"
+      chmod 600 "$HOME/.kube/config"
+
+  - name: Create a temporary kind cluster
+    if: inputs.kubeconfig == ''
+    shell: bash
+    env:
+      IMAGE: ${{ inputs.image }}
+      TOKEN: ${{ inputs.github-token }}
+      ACTOR: ${{ github.actor }}
+    run: |
+      if ! command -v kind >/dev/null; then
+        curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.27.0/kind-linux-amd64
+        chmod +x kind
+        sudo mv kind /usr/local/bin/kind
+      fi
+      kind create cluster --wait 120s
+      if [ -n "$IMAGE" ]; then
+        echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+        docker pull "$IMAGE"
+        kind load docker-image "$IMAGE"
+      fi
+
+  - name: Check cluster access
+    shell: bash
+    run: kubectl get nodes

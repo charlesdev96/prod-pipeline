@@ -1,0 +1,172 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # Stage 1: lint and format check (fails on any lint error)
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: npm
+    - run: npm ci
+    - name: Lint
+      run: npm run lint
+    - name: Format check
+      run: npm run format:check
+
+  # Stage 2: unit tests with coverage (fails if a test fails or coverage is under 70%)
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: npm
+    - run: npm ci
+    - name: Unit tests with coverage
+      run: npm test
+    - name: Upload coverage report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage/
+
+  # Stage 3: SAST with Semgrep (fails on ERROR severity = high/critical findings)
+  sast:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+    - uses: actions/checkout@v4
+    - name: Semgrep scan
+      run: semgrep scan --config p/javascript --config p/nodejs --severity ERROR --error --metrics=off .
+
+  # Stage 4: dependency vulnerability audit (fails on high or critical)
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: npm
+    - run: npm ci
+    - name: npm audit
+      run: npm audit --omit=dev --audit-level=high
+
+  # Stages 5, 6, 7: build image, scan image, push image
+  image:
+    needs: [lint, test, sast, audit]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Work out the image name (lowercase, SHA tag)
+      id: meta
+      run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Build image (multi-stage Dockerfile)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        load: true
+        push: false
+        tags: ${{ steps.meta.outputs.image }}
+        build-args: APP_VERSION=${{ github.sha }}
+        labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+    - name: Scan image with Trivy (fails on CRITICAL)
+      run: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:latest image --exit-code 1 --severity CRITICAL \
+          "${{ steps.meta.outputs.image }}"
+
+    - name: Log in to GitHub Container Registry
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Push image
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: docker push "${{ steps.meta.outputs.image }}"
+
+  # Stages 8 and 9: deploy to staging, then smoke test it (same job = same cluster)
+  deploy-staging:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/setup-kube
+      with:
+        kubeconfig: ${{ secrets.KUBECONFIG }}
+        image: ${{ needs.image.outputs.image }}
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Deploy to staging
+      run: |
+        kubectl apply -f k8s/staging/namespace.yaml
+        kubectl apply -f k8s/staging/service.yaml
+        sed "s|IMAGE_PLACEHOLDER|${{ needs.image.outputs.image }}|g" k8s/staging/deployment.yaml | kubectl apply -f -
+        kubectl rollout status deployment/webapp -n staging --timeout=300s
+    - name: Smoke test staging
+      run: scripts/smoke-test.sh staging
+
+  # Stages 10 and 11: production deploy (manual approval) + health check + auto rollback
+  deploy-production:
+    needs: [image, deploy-staging]
+    runs-on: ubuntu-latest
+    # The "production" environment has Required reviewers turned on,
+    # so the job waits here until someone approves it.
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/setup-kube
+      with:
+        kubeconfig: ${{ secrets.KUBECONFIG }}
+        image: ${{ needs.image.outputs.image }}
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Blue-green deploy with health check and automatic rollback
+      run: scripts/deploy.sh "${{ needs.image.outputs.image }}" production
+    - name: Notify success
+      if: success()
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: scripts/notify.sh success "Deployed ${GITHUB_SHA::7} to production"
+    - name: Notify failure
+      if: failure()
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: scripts/notify.sh failure "Production deploy of ${GITHUB_SHA::7} failed or was rolled back"
